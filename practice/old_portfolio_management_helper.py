@@ -140,7 +140,6 @@ def calc_summary_statistics(
     drop_indexes: Union[list, str] = None,
     drop_before_keep: bool = False,
     _timeframe_name: str = None,
-    use_pandas_skew_kurt: bool = False
 ):
     """
     Calculates comprehensive summary statistics for a time series of returns, including performance metrics, risk measures, and correlations. 
@@ -206,10 +205,6 @@ def calc_summary_statistics(
         Determines the order of applying `drop_columns`/`drop_indexes` and `keep_columns`/`keep_indexes`. 
         If True, drops specified columns/indexes first before keeping others.
 
-    use_pandas_skew_kurt : bool, optional (default=False)
-        If True, calculates skewness and kurtosis using the default pandas methods. If False, the function will compute skewness and kurtosis using 
-        custom formulas to provide more control over the calculations.
-
     _timeframe_name : str, optional (default=None)
         Internal parameter used for naming columns when processing specific timeframes. Not intended for direct user input.
 
@@ -235,38 +230,10 @@ def calc_summary_statistics(
 
     Notes:
     -----
-    - **Skewness**: 
-    Skewness measures the asymmetry of the distribution of returns. A positive skew (right skew) indicates a distribution with a longer tail on the right side, implying more frequent small losses and occasional large gains. 
-    A negative skew (left skew) indicates a distribution with a longer tail on the left side, implying more frequent small gains and occasional large losses.
-    The function can compute skewness using two methods:
-        - Custom Formula: 
-        \[
-        \text{Skewness} = \frac{\sum (\text{mean-centered returns})^3}{\text{std}^3 \times (n - 1)}
-        \]
-        - Pandas Method: Calculated using the built-in `.skew()` function.
-    
-    - **Excess Kurtosis**: 
-    Excess Kurtosis measures the "tailedness" of the return distribution relative to a normal distribution. A kurtosis value greater than 0 (positive) indicates a "leptokurtic" distribution, which has fatter tails, meaning more extreme outliers. 
-    A kurtosis value less than 0 (negative) indicates a "platykurtic" distribution, which has thinner tails, meaning fewer outliers.
-    Like skewness, excess kurtosis can be calculated using:
-        - Custom Formula:
-        \[
-        \text{Excess Kurtosis} = \frac{\sum (\text{mean-centered returns})^4}{\text{std}^4 \times (n - 1)} - 3
-        \]
-        - Pandas Method: Calculated using the built-in `.kurtosis()` function.
-    
-    - **Value at Risk (VaR) and Conditional VaR (CVaR)**: 
-    VaR represents the maximum expected loss over a specified period at a given confidence level, while CVaR (or Expected Shortfall) is the average loss that exceeds the VaR threshold. 
-    These metrics are useful for understanding the potential downside risk.
-
-    - **Maximum Drawdown, Peak, Bottom, Recovery, and Duration**:
-    - **Maximum Drawdown**: Measures the largest peak-to-trough decline in the portfolio value. It highlights the worst observed loss.
-    - **Peak**: The date when the portfolio reached its highest value before a drawdown.
-    - **Bottom**: The date when the portfolio hit the lowest point during a drawdown.
-    - **Recovery**: The date when the portfolio recovered to its previous peak after a drawdown. If no recovery is observed, it remains `None`.
-    - **Duration**: The total time, in days, the portfolio stayed below its previous peak during a drawdown period.
+    - The function is flexible enough to handle both total and excess returns. Ensure `rf` is correctly provided if calculating excess returns.
+    - Custom timeframes can be used to gain insights into different periods, making it easier to compare performance metrics across specific intervals.
+    - Value at Risk (VaR) and Conditional VaR (CVaR) are calculated for each specified quantile to capture potential downside risks.
     """
-
 
     returns = returns.copy()
     if isinstance(rf, (pd.Series, pd.DataFrame)):
@@ -372,25 +339,8 @@ def calc_summary_statistics(
     summary_statistics['Annualized Sharpe'] = summary_statistics['Sharpe'] * np.sqrt(annual_factor)
     summary_statistics['Min'] = returns.min()
     summary_statistics['Max'] = returns.max()
-    data_excess_mean = returns - returns.mean()
-    if not use_pandas_skew_kurt:
-        try:
-            summary_statistics['Skewness'] = (
-        ((data_excess_mean ** 3).sum(axis=0)) / 
-        ((returns.std(axis=0) ** 3) * (len(returns) - 1))
-    )
-            summary_statistics['Excess Kurtosis'] = (
-        ((data_excess_mean ** 4).sum(axis=0)) / 
-        ((returns.std(axis=0) ** 4) * (len(returns) - 1)) - 3
-    )
-        except Exception as e:
-            print(f'Could not calculate Skewness and Excess Kurtosis using formula,default to pandas: {e}')
-            
-            summary_statistics['Skewness'] = returns.skew()
-            summary_statistics['Excess Kurtosis'] = returns.kurtosis()
-    else:
-        summary_statistics['Skewness'] = returns.skew()
-        summary_statistics['Excess Kurtosis'] = returns.kurtosis()
+    summary_statistics['Skewness'] = returns.skew()
+    summary_statistics['Excess Kurtosis'] = returns.kurtosis()
     var_quantile = [var_quantile] if isinstance(var_quantile, (float, int)) else var_quantile
     for var_q in var_quantile:
         summary_statistics[f'Historical VaR ({var_q:.2%})'] = returns.quantile(var_q, axis = 0)
