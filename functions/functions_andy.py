@@ -9,7 +9,7 @@ import seaborn as sns
 from sklearn.linear_model import LinearRegression
 from dask.distributed import Client, wait
 # From HW1
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Union, Callable
 import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
 from sklearn.metrics import r2_score
@@ -1035,5 +1035,572 @@ def simplified_rolling_ols_regression(
     oos_correlation = actual_vs_replication.corr()
     
     return oos_r2, rolling_betas, replicated_rolling, oos_correlation
+
+
+def detailed_risk_statistics(
+    data: pd.DataFrame, 
+    var_quantile: float = 0.05,
+    annual_factor: int = 12,
+    use_pmh: bool = False
+) -> Dict[str, Union[pd.Series, Dict]]:
+    """
+    Calculate detailed risk statistics for financial time series data, including skewness, kurtosis, VaR, CVaR, and drawdown metrics.
+    
+    This function computes key risk metrics for each column in the input DataFrame, allowing for a comprehensive evaluation of 
+    the risk and return characteristics of multiple assets or funds.
+    
+    Parameters:
+    ----------
+    data : pd.DataFrame
+        DataFrame containing the time series data for multiple assets or funds.
+        
+    var_quantile : float, optional (default=0.05)
+        The quantile for Value at Risk (VaR) calculation, e.g., 0.05 for a 5% VaR.
+        
+    annual_factor : int, optional (default=12)
+        The factor used to annualize returns and other metrics, e.g., 12 for monthly data or 252 for daily data.
+        
+    use_pmh : bool, optional (default=False)
+        If True, use `pmh.calc_summary_statistics` as an alternative method to calculate and return similar statistics.
+        
+    Returns:
+    -------
+    Dict[str, Union[pd.Series, Dict]]:
+        A dictionary containing the following key metrics:
+            - "Skewness": Series of skewness values for each column.
+            - "Excess Kurtosis": Series of excess kurtosis values for each column.
+            - "Maximum Drawdown": Series of maximum drawdown values for each column.
+            - "Peak Dates": List of dates representing the highest peaks before maximum drawdowns.
+            - "Lowest (Drawdown Low) Dates": List of dates representing the lowest drawdown points.
+            - "Recovery Dates": List of dates when the asset/fund recovered to the previous peak level.
+            - "Days to Recovery": Dictionary of recovery days or status for each column.
+    
+    Explanation:
+    ------------
+    The function calculates the following:
+    - **Skewness**: Measures the asymmetry of the return distribution. Positive skew indicates a longer tail on the right.
+    - **Excess Kurtosis**: Measures the "tailedness" of the distribution. Higher kurtosis indicates more extreme outliers.
+    - **VaR (Value at Risk)**: Estimates the potential loss at a given confidence level.
+    - **CVaR (Conditional VaR)**: The expected loss beyond the VaR threshold.
+    - **Max Drawdown**: The maximum observed loss from peak to trough.
+    - **Recovery Days**: The number of days taken to recover from the maximum drawdown to the previous peak.
+    
+    Usage:
+    -----
+    ```python
+    # Example usage:
+    stats = detailed_risk_statistics(data=my_data, var_quantile=0.05, annual_factor=12, use_pmh=False)
+    
+    for key, value in stats.items():
+        print(f"{key}:\n{value}\n")
+    
+    # Alternative using pmh
+    stats_pmh = detailed_risk_statistics(data=my_data, use_pmh=True)
+    ```
+    """
+    if use_pmh:
+        try:
+            from pmh import calc_summary_statistics
+            pmh_stats = calc_summary_statistics(
+                data, 
+                annual_factor=annual_factor, 
+                provided_excess_returns=True, 
+                var_quantile=var_quantile, 
+                use_pandas_skew_kurt=True
+            )
+            return pmh_stats.loc[:, ['Min', 'Max', 'Skewness', 'Excess Kurtosis',
+                                     f'Historical VaR ({var_quantile:.2%})', 
+                                     f'Annualized Historical VaR ({var_quantile:.2%})',
+                                     f'Historical CVaR ({var_quantile:.2%})', 
+                                     f'Annualized Historical CVaR ({var_quantile:.2%})',
+                                     'Max Drawdown', 'Peak', 'Bottom', 'Recovery', 'Duration (days)']].T.to_dict()
+        except ImportError:
+            print("pmh module not found, proceeding with manual calculations.")
+
+    # Calculate Skewness and Excess Kurtosis
+    skewness = ((data - data.mean()) ** 3 / (data.std() ** 3 * (len(data) - 1))).sum()
+    kurtosis = ((data - data.mean()) ** 4 / (data.std() ** 4 * (len(data) - 1))).sum() - 3
+
+    # Calculate VaR and CVaR
+    var = data.quantile(var_quantile)
+    cvar = data[data < var].mean()
+
+    # Calculate Wealth Index, Drawdown, and Maximum Drawdown
+    wealth_index = (1 + data).cumprod()
+    previous_peaks = wealth_index.cummax()
+    drawdown = (wealth_index - previous_peaks) / previous_peaks
+    max_drawdown = drawdown.min()
+
+    # Peak Dates
+    peak = [previous_peaks.loc[:drawdown[col].idxmin(), col].idxmax() for col in data.columns]
+    
+    # Lowest (Drawdown Low) Dates
+    lowest = drawdown.idxmin()
+    
+    # Calculate Recovery Dates
+    recovery_dates = []
+    for col in data.columns:
+        max_peak_value = previous_peaks.loc[:drawdown[col].idxmin(), col].max()
+        post_drawdown_data = wealth_index.loc[drawdown[col].idxmin():, col]
+        recovery_date = post_drawdown_data[post_drawdown_data >= max_peak_value].index.min()
+        recovery_dates.append(recovery_date)
+
+    # Calculate Recovery Days
+    recovery_days = {}
+    for col, recovery_date in zip(data.columns, recovery_dates):
+        if recovery_date is not None:
+            days_to_recover = (recovery_date - drawdown[col].idxmin()).days
+            recovery_days[col] = days_to_recover
+        else:
+            recovery_days[col] = "Not Recovered"
+
+    # Compile the results into a dictionary
+    results = {
+        "Skewness": skewness,
+        "Excess Kurtosis": kurtosis,
+        "Maximum Drawdown": max_drawdown,
+        "Peak Dates": peak,
+        "Lowest (Drawdown Low) Dates": lowest,
+        "Recovery Dates": recovery_dates,
+        "Days to Recovery": recovery_days
+    }
+
+    return results
+
+
+def calculate_expanding_var(
+    data: Union[pd.DataFrame, pd.Series], 
+    start_date: str, 
+    column_name: str = None, 
+    quantile: float = 0.05, 
+    alternative_method: bool = False,
+    plot: bool = False
+) -> pd.DataFrame:
+    """
+    Calculates the expanding window Value at Risk (VaR) for a given time series or DataFrame column starting from a specific date.
+    
+    This function computes VaR using an expanding window approach, starting from a specified date. It allows for two 
+    calculation methods: a direct calculation from the input data, or an alternative method where data is shifted before 
+    calculating the VaR. Additionally, the function provides an option to plot the results for visual analysis.
+    
+    Parameters:
+    ----------
+    data : Union[pd.DataFrame, pd.Series]
+        The input DataFrame or Series containing financial time series data.
+        
+    start_date : str
+        The start date from which to begin calculating the VaR.
+        
+    column_name : str, optional
+        The name of the column in `data` for which VaR is to be calculated. If `data` is a Series, this is not needed.
+        
+    quantile : float, optional (default=0.05)
+        The quantile level for VaR calculation. Commonly set at 0.05 (5%) to measure the 5% worst-case loss.
+    
+    alternative_method : bool, optional (default=False)
+        If True, uses an alternative method where the data is shifted before calculating VaR. This method can help 
+        in cases where the risk model needs to account for lag effects.
+        
+    plot : bool, optional (default=False)
+        If True, plots the time series data along with the calculated VaR for visual inspection. It highlights points 
+        where the returns fall below the calculated VaR threshold.
+    
+    Returns:
+    -------
+    pd.DataFrame
+        A DataFrame with the original values and their corresponding VaR values, starting from the specified `start_date`.
+        Columns include:
+            - Original data values.
+            - Calculated VaR values using the specified quantile level.
+    
+    Usage:
+    -----
+    ```python
+    VaR_df = calculate_expanding_var(data=my_data, start_date='2000-12-29', plot=True)
+    display(VaR_df)
+    
+    # Example usage
+    VaR_df = calculate_expanding_var(data, '2000-12-29', column_name='Excess Market Returns', alternative_method=True, plot=True)
+    display(VaR_df)
+
+    # Frequency Calculation
+    frequency = (VaR_df["Excess Market Returns_VaR_0.05"] > VaR_df["Excess Market Returns"]).value_counts()
+    display(frequency)
+    print(f"Frequency of Excess Market Returns below VaR: {frequency[True]}")
+    quantile = 0.05
+    hits = (VaR_df["Excess Market Returns"] < VaR_df["Excess Market Returns_VaR_0.05"]).value_counts()[True]
+    hit_ratio = hits / len(VaR_df)
+    hit_rate = np.abs((hit_ratio/quantile)-1)
+    print(f"Number of hits: {hits}")
+    print(f"Hit rate: {hit_rate:.5f}")
+    print(f"Hit ratio: {hit_ratio:.5f}")
+    
+    ```
+    
+    Explanation:
+    ------------
+    The function calculates the following:
+    - **Expanding Window VaR**: Calculates VaR by expanding the sample size from the start date, ensuring a more comprehensive 
+      view of the risk as more data is considered.
+    - **Alternative Method**: Adds a lag effect by shifting the data before applying the expanding quantile calculation.
+    - **Plotting**: Allows users to visually assess periods where the returns fall below the VaR threshold, offering insights 
+      into the frequency and severity of extreme returns.
+    """
+    # Determine if the data is a DataFrame or Series
+    if isinstance(data, pd.Series):
+        target_data = data
+        if column_name:
+            print("Warning: `column_name` is not needed when `data` is a Series. Ignoring `column_name`.")
+    elif isinstance(data, pd.DataFrame) and column_name:
+        target_data = data[column_name]
+    else:
+        raise ValueError("When providing a DataFrame, `column_name` must be specified.")
+    
+    first_date = pd.to_datetime(start_date)
+    
+    # Use alternative method if specified
+    if alternative_method:
+        shifted_data = target_data.shift(1)
+        var_series = shifted_data.expanding(min_periods=60).quantile(quantile)
+        combined_data = pd.concat([target_data, var_series], axis=1).dropna()
+        combined_data.columns = [target_data.name, f"{target_data.name}_Historical_VaR_{quantile}"]
+    else:
+        calculation_data = target_data.loc[:first_date]
+        var_series = target_data.expanding(min_periods=len(calculation_data)).quantile(quantile).shift(1)
+        combined_data = pd.concat([target_data.loc[first_date:], var_series], axis=1).dropna()
+        combined_data.columns = [target_data.name, f"{target_data.name}_VaR_{quantile}"]
+
+    # Plot if requested
+    if plot:
+        plt.figure(figsize=(10, 6))
+        plt.axhline(y=0, linestyle='--', color='black', alpha=0.5)
+        
+        # Plot calculated VaR
+        plt.plot(
+            combined_data.index,
+            combined_data[f"{target_data.name}_VaR_{quantile}"],
+            color='blue',
+            label="VaR"
+        )
+        
+        # Highlight returns below VaR
+        returns_below_var = combined_data.loc[combined_data[target_data.name] < combined_data[f"{target_data.name}_VaR_{quantile}"]]
+        plt.plot(
+            combined_data.index,
+            combined_data[target_data.name],
+            color='green',
+            label="Returns",
+            alpha=0.5
+        )
+        plt.plot(
+            returns_below_var.index,
+            returns_below_var[target_data.name],
+            linestyle="",
+            marker="o",
+            color='red',
+            label="Returns < VaR",
+            markersize=3
+        )
+        
+        plt.title(f"Expanding VaR of {target_data.name} (Quantile: {quantile:.2%})")
+        plt.xlabel("Date")
+        plt.ylabel("Values")
+        plt.legend()
+        plt.show()
+    
+    return combined_data
+
+
+def historical_expanding_var(return_series: pd.Series, percentile: float = 0.05, window_size: int = 60) -> pd.Series:
+    return return_series.expanding(min_periods=window_size).quantile(percentile)
+
+def historical_rolling_var(return_series: pd.Series, percentile: float, window_size: int = 60) -> pd.Series:
+    """
+    Calculates the rolling Value at Risk (VaR) using a specified percentile and window size. Note no shifting is done.
+    
+    Parameters:
+    ----------
+    return_series : pd.Series
+        The series of returns for which the rolling VaR is to be calculated.
+        
+    percentile : float
+        The percentile for calculating the VaR (e.g., 0.05 for 5% VaR).
+        
+    window_size : int, optional (default=60)
+        The size of the rolling window over which to calculate the VaR.
+        
+    Returns:
+    -------
+    pd.Series
+        A series of the calculated rolling VaR values.
+    """
+    return return_series.rolling(window=window_size).quantile(percentile)
+
+def var_calculator(
+    data: pd.DataFrame, 
+    var_func: Callable[[pd.Series, float], pd.Series], 
+    target_column: str, 
+    var_name: str, 
+    percentile: float, 
+    window_size: int = 60, 
+    start_date: str = "2001-01-01", 
+    limit_plot: bool = True,
+    plot_width: int = 10, 
+    plot_height: int = 6,
+    colors: list = ["blue", "red", "green"]
+):
+    """
+    General function to calculate and plot Value at Risk (VaR) for specified data.
+    
+    Parameters:
+    ----------
+    data : pd.DataFrame
+        The input DataFrame containing the returns time series.
+        
+    var_func : Callable[[pd.Series, float], pd.Series]
+        The function to be used for calculating VaR. It should accept a pd.Series and percentile as input.
+        
+    target_column : str
+        The name of the column in `data` for which VaR is to be calculated.
+        
+    var_name : str
+        The name to assign to the calculated VaR column.
+        
+    percentile : float
+        The percentile for calculating the VaR (e.g., 0.05 for 5% VaR).
+        
+    window_size : int, optional (default=60)
+        The size of the rolling window used by `var_func` for VaR calculation.
+        
+    start_date : str, optional (default="2001-01-01")
+        The start date from which to begin plotting and calculating hit ratios.
+        
+    limit_plot : bool, optional (default=True)
+        If True, limits the y-axis of the plot.
+        
+    plot_width : int, optional (default=10)
+        The width of the plot.
+        
+    plot_height : int, optional (default=6)
+        The height of the plot.
+        
+    colors : list, optional (default=["blue", "red", "green"])
+        List of colors for plotting. Used for VaR line, highlighted points, and main data series respectively.
+        
+    Returns:
+    -------
+    None
+    
+    
+    ```python
+    
+    
+    
+    # Example usage:
+    var_calculator(
+        data=spy_excess_returns, 
+        var_func=historical_rolling_var, 
+        target_column="SPY", 
+        var_name="Historical 60 Rolling VaR 5%", 
+        percentile=0.05,
+        window_size=60,
+        start_date="2001-01-01",
+        limit_plot=True,
+        plot_width=10, 
+        plot_height=6,
+        colors=["blue", "red", "green"]
+    )
+    ```
+    
+    
+    """
+    excess_returns = data.copy()
+    excess_returns["Shifted"] = excess_returns[target_column].shift()
+    
+    # Calculate VaR using the provided function
+    excess_returns[var_name] = var_func(excess_returns["Shifted"], percentile, window_size)
+    
+    # Drop NaN values and limit to start_date
+    excess_returns = excess_returns.dropna(axis=0)
+    excess_returns = excess_returns.loc[start_date:]
+
+    # Plotting
+    plt.figure(figsize=(plot_width, plot_height))
+    plt.axhline(y=0, linestyle='--', color='black', alpha=0.5)
+    
+    # Plot VaR line
+    plt.plot(
+        excess_returns.index,
+        excess_returns[var_name],
+        color=colors[0],
+        label=var_name
+    )
+    
+    # Plot main returns data
+    plt.plot(
+        excess_returns.index,
+        excess_returns[target_column],
+        color=colors[2],
+        label=target_column,
+        alpha=0.5
+    )
+    
+    # Highlight returns below VaR
+    returns_below_var = excess_returns[excess_returns[target_column] < excess_returns[var_name]]
+    plt.plot(
+        returns_below_var.index,
+        returns_below_var[target_column],
+        linestyle="",
+        marker="o",
+        color=colors[1],
+        label=f"Returns < {var_name}",
+        markersize=3
+    )
+    
+    # Set y-axis limits if required
+    if limit_plot:
+        plt.ylim(min(excess_returns[target_column]), 0.01)
+    
+    # Calculate hit ratio
+    hit_ratio = len(returns_below_var.index) / len(excess_returns.index)
+    hit_ratio_error = abs((hit_ratio / percentile) - 1)
+    
+    # Add title and labels
+    plt.title(f"{var_name} of {target_column}")
+    plt.xlabel(f"Hit Ratio: {hit_ratio:.2%}; Hit Ratio Error: {hit_ratio_error:.2%}")
+    plt.ylabel("Excess Returns")
+    plt.legend()
+    plt.show()
+
+def calculate_rolling_var(
+    data: Union[pd.DataFrame, pd.Series], 
+    start_date: str, 
+    column_name: str = None, 
+    quantile: float = 0.05, 
+    window_size: int = 60,
+    plot: bool = False
+) -> pd.DataFrame:
+    """
+    Calculates the rolling window Value at Risk (VaR) for a given time series or DataFrame column starting from a specific date.
+    
+    This function computes VaR using a rolling window approach, starting from a specified date. It calculates the VaR based on a 
+    rolling window of historical data, which moves forward through the time series. Additionally, the function provides an option 
+    to plot the results for visual analysis.
+    
+    Parameters:
+    ----------
+    data : Union[pd.DataFrame, pd.Series]
+        The input DataFrame or Series containing financial time series data.
+        
+    start_date : str
+        The start date from which to begin calculating the VaR.
+        
+    column_name : str, optional
+        The name of the column in `data` for which VaR is to be calculated. If `data` is a Series, this is not needed.
+        
+    quantile : float, optional (default=0.05)
+        The quantile level for VaR calculation. Commonly set at 0.05 (5%) to measure the 5% worst-case loss.
+        
+    window_size : int, optional (default=60)
+        The size of the rolling window used for VaR calculation. Determines how many previous observations are used for each VaR value.
+        
+    plot : bool, optional (default=False)
+        If True, plots the time series data along with the calculated VaR for visual inspection. It highlights points 
+        where the returns fall below the calculated VaR threshold.
+    
+    Returns:
+    -------
+    pd.DataFrame
+        A DataFrame with the original values and their corresponding VaR values, starting from the specified `start_date`.
+        Columns include:
+            - Original data values.
+            - Calculated VaR values using the specified quantile level.
+    
+    Usage:
+    -----
+    ```python
+    VaR_df = calculate_rolling_var(data=my_data, start_date='2000-12-29', plot=True)
+    display(VaR_df)
+    
+    # Example usage
+    VaR_df = calculate_rolling_var(data, '2000-12-29', column_name='Excess Market Returns', window_size=60, plot=True)
+    display(VaR_df)
+
+    # Frequency Calculation
+    frequency = (VaR_df["Excess Market Returns_VaR_0.05"] > VaR_df["Excess Market Returns"]).value_counts()
+    display(frequency)
+    print(f"Frequency of Excess Market Returns below VaR: {frequency[True]}")
+    ```
+    
+    Explanation:
+    ------------
+    The function calculates the following:
+    - **Rolling Window VaR**: Calculates VaR by applying a rolling window to the data, ensuring that each VaR value is based on 
+      a consistent historical sample size. This provides a dynamic view of risk over time.
+    - **Plotting**: Allows users to visually assess periods where the returns fall below the VaR threshold, offering insights 
+      into the frequency and severity of extreme returns.
+    """
+    # Determine if the data is a DataFrame or Series
+    if isinstance(data, pd.Series):
+        target_data = data
+        if column_name:
+            print("Warning: `column_name` is not needed when `data` is a Series. Ignoring `column_name`.")
+    elif isinstance(data, pd.DataFrame) and column_name:
+        target_data = data[column_name]
+    else:
+        raise ValueError("When providing a DataFrame, `column_name` must be specified.")
+    
+    first_date = pd.to_datetime(start_date)
+    
+    # Calculate rolling VaR
+    var_series = target_data.rolling(window=window_size).quantile(quantile)
+    combined_data = pd.concat([target_data, var_series], axis=1).dropna()
+    combined_data.columns = [target_data.name, f"{target_data.name}_Rolling_VaR_{quantile}"]
+    
+    # Limit data to the start date
+    combined_data = combined_data.loc[first_date:]
+
+    # Plot if requested
+    if plot:
+        plt.figure(figsize=(10, 6))
+        plt.axhline(y=0, linestyle='--', color='black', alpha=0.5)
+        
+        # Plot calculated VaR
+        plt.plot(
+            combined_data.index,
+            combined_data[f"{target_data.name}_Rolling_VaR_{quantile}"],
+            color='blue',
+            label="VaR"
+        )
+        
+        # Highlight returns below VaR
+        returns_below_var = combined_data.loc[combined_data[target_data.name] < combined_data[f"{target_data.name}_Rolling_VaR_{quantile}"]]
+        plt.plot(
+            combined_data.index,
+            combined_data[target_data.name],
+            color='green',
+            label="Returns",
+            alpha=0.5
+        )
+        plt.plot(
+            returns_below_var.index,
+            returns_below_var[target_data.name],
+            linestyle="",
+            marker="o",
+            color='red',
+            label="Returns < VaR",
+            markersize=3
+        )
+        
+        plt.title(f"Rolling VaR of {target_data.name} (Quantile: {quantile:.2%})")
+        plt.xlabel("Date")
+        plt.ylabel("Values")
+        plt.legend()
+        plt.show()
+    
+    return combined_data
+
+
+
 
 
