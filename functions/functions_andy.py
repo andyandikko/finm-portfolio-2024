@@ -13,7 +13,8 @@ from typing import Tuple, Dict, Union, Callable
 import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
 from sklearn.metrics import r2_score
-
+from scipy.stats import norm
+from scipy.stats import describe
 def load_data(filename, path="./data", sheet_name="excess returns"):
     """
     Load data from an Excel file and set the 'Date' column as the index.
@@ -117,70 +118,95 @@ def calculate_summary_statistics(
 def calculate_tangency_portfolio(
     data: pd.DataFrame, 
     annual_factor: int = 12, 
-    use_pmh: bool = False
-) -> pd.DataFrame:
+    use_alternative: bool = False
+) -> Tuple[pd.DataFrame, float, float, float]:
     """
-    Calculate the tangency portfolio weights, mean, volatility, and Sharpe ratio.
+    Calculate the tangency portfolio weights, mean, volatility, and Sharpe ratio using input data.
+    
+    This function calculates the tangency portfolio weights by taking the inverse of the covariance matrix
+    and using the mean returns of the assets. It also computes the portfolio's mean, volatility, and Sharpe ratio.
+    Alternatively, the function can use the `pmh.calc_tangency_weights` method if specified.
     
     Parameters:
-    - data (pd.DataFrame): The input data containing returns.
-    - annual_factor (int): The factor used for annualizing the covariance matrix and returns. Default is 12 (monthly).
-    - use_pmh (bool): If True, uses the `pmh.calc_tangency_weights` method as an alternative. Default is False.
-    
+    ----------
+    data : pd.DataFrame
+        DataFrame containing asset returns.
+        
+    annual_factor : int, optional (default=12)
+        Factor used to annualize returns and the covariance matrix. Use 12 for monthly data and 252 for daily data.
+        
+    use_alternative : bool, optional (default=False)
+        If True, the function will use `pmh.calc_tangency_weights` instead of the standard calculation.
+        
     Returns:
-    - pd.DataFrame: A DataFrame containing tangency portfolio weights or the results from `pmh.calc_tangency_weights`.
+    -------
+    Tuple[pd.DataFrame, float, float, float]
+        - Tangency portfolio weights as a DataFrame.
+        - Tangency portfolio mean return.
+        - Tangency portfolio volatility.
+        - Tangency portfolio Sharpe ratio.
     
-    Example:
-    ```
-    tangency_weights = calculate_tangency_portfolio(data, annual_factor=12)
-    tangency_weights_pmh = calculate_tangency_portfolio(data, use_pmh=True)
-    ```
+    Explanation:
+    ------------
+    The tangency portfolio is constructed by finding the weights that maximize the Sharpe ratio.
+    This is done using the inverse of the covariance matrix of asset returns and the mean returns.
+    Alternatively, the function can use `pmh.calc_tangency_weights` if `use_alternative` is set to True.
     """
-    if use_pmh:
-        # Use the pmh method as an alternative approach
-        try:
-            tangency_weights = pmh.calc_tangency_weights(data, annual_factor=annual_factor)
-            return tangency_weights
-        except Exception as e:
-            raise Exception(f"An error occurred when using pmh method: {e}")
     
-    try:
-        # Calculate covariance matrix and its inverse
-        cov_matrix = data.cov()
-        inverse_cov_matrix = np.linalg.inv(cov_matrix) * annual_factor
-        
-        # Calculate annualized mean returns
-        mean_data = data.mean() * annual_factor
-        
-        # Tangency portfolio weights calculation
-        tangency_weights = pd.DataFrame(
-            (inverse_cov_matrix @ mean_data) / (inverse_cov_matrix @ mean_data @ np.ones(mean_data.shape)),
-            index=data.columns, 
-            columns=["Tangency Weights"]
-        )
-        
-        # Sort tangency weights
-        tangency_weights = tangency_weights.sort_values(by="Tangency Weights", ascending=False)
-        
-        # Tangency portfolio statistics
-        tangency_mean = mean_data @ tangency_weights
-        tangency_portfolio_var = (tangency_weights.T @ cov_matrix @ tangency_weights) * annual_factor
-        tangency_vol = np.sqrt(tangency_portfolio_var)
-        tangency_sharpe = tangency_mean / tangency_vol
-        
-        # Prepare results
-        result = pd.DataFrame({
-            "Tangency Mean": [tangency_mean.item()],
-            "Tangency Volatility": [tangency_vol.item()],
-            "Tangency Sharpe Ratio": [tangency_sharpe.item()]
-        })
-        
-        # Combine tangency weights with portfolio statistics
-        result = pd.concat([tangency_weights, result], axis=1)
-        return result
+    if use_alternative:
+        # Use pmh alternative method
+        tangency_weights = pmh.calc_tangency_weights(data, annual_factor=annual_factor)
+        return tangency_weights
+
+    # Main method calculation
+    data_mean = describe(data, axis=0)[2] * annual_factor
+    data_std = data.std() * (annual_factor ** 0.5)
+    securities = data.columns
+    mean_excess_returns = np.reshape(data_mean, (-1,))
+    covariance_matrix = data.cov(ddof=1).to_numpy()
+    inverse_cov_matrix = np.linalg.inv(covariance_matrix)
+    tangency_weights = (inverse_cov_matrix @ mean_excess_returns) / (
+        np.ones(shape=(1, inverse_cov_matrix.shape[0])) @ inverse_cov_matrix @ mean_excess_returns
+    )
+
+    if not (round(tangency_weights.sum()) == 1):
+        raise ValueError("The sum of the tangency portfolio weights does not equal 1.")
+
+    # Calculate Sharpe ratios for each asset
+    sharpe_ratios = data_mean / data_std
+    sharpe_data = pd.DataFrame({"Asset": securities, "Sharpe": sharpe_ratios})
+
+    weights_df = pd.DataFrame({"Asset": securities, "Weights": tangency_weights})
     
-    except Exception as e:
-        raise Exception(f"An error occurred when calculating tangency portfolio: {e}")
+    # Tangency portfolio stats calculation
+    merged_df = pd.merge(left=sharpe_data, right=weights_df, on="Asset", how="outer")
+    tangency_portfolio_annualised_mean = merged_df.eval("`Sharpe` * Weights").sum()
+    tangency_portfolio_variance = (
+        merged_df["Weights"].to_numpy().T @ covariance_matrix @ merged_df["Weights"].to_numpy()
+    )
+    tangency_portfolio_annualised_stdev = tangency_portfolio_variance ** 0.5 * annual_factor ** 0.5
+    tangency_portfolio_sharpe = tangency_portfolio_annualised_mean / tangency_portfolio_annualised_stdev
+
+    print(f"Annualised mean returns for tangency portfolio = {tangency_portfolio_annualised_mean:.4f}")
+    print(f"Annualised volatility for tangency portfolio = {tangency_portfolio_annualised_stdev:.4f}")
+    print(f"Annualised Sharpe for tangency portfolio = {tangency_portfolio_sharpe:.4f}")
+
+    # Display sorted weights and rankings
+    print("Sorted Rankings for weights")
+    display(weights_df.sort_values(by="Weights", ascending=False, axis=0))
+
+    print("Rankings for Sharpe")
+    display(sharpe_data.sort_values(by="Sharpe", ascending=False, axis=0))
+
+    if (
+        sharpe_data.sort_values(by="Sharpe", ascending=False, axis=0).index ==
+        weights_df.sort_values(by="Weights", ascending=False, axis=0).index
+    ).all():
+        print("Rankings are the same")
+    else:
+        print("Rankings are different")
+
+    return weights_df, tangency_portfolio_annualised_mean, tangency_portfolio_annualised_stdev, tangency_portfolio_sharpe
 
 
 def find_corr(
@@ -1100,8 +1126,7 @@ def detailed_risk_statistics(
     """
     if use_pmh:
         try:
-            from pmh import calc_summary_statistics
-            pmh_stats = calc_summary_statistics(
+            pmh_stats = pmh.calc_summary_statistics(
                 data, 
                 annual_factor=annual_factor, 
                 provided_excess_returns=True, 
@@ -1170,7 +1195,7 @@ def detailed_risk_statistics(
 
 def calculate_expanding_var(
     data: Union[pd.DataFrame, pd.Series], 
-    start_date: str, 
+    end_training_date: str, 
     column_name: str = None, 
     quantile: float = 0.05, 
     alternative_method: bool = False,
@@ -1188,8 +1213,8 @@ def calculate_expanding_var(
     data : Union[pd.DataFrame, pd.Series]
         The input DataFrame or Series containing financial time series data.
         
-    start_date : str
-        The start date from which to begin calculating the VaR.
+    end_training_date : str
+        The start date minus 1 from which to begin calculating the VaR.
         
     column_name : str, optional
         The name of the column in `data` for which VaR is to be calculated. If `data` is a Series, this is not needed.
@@ -1208,7 +1233,7 @@ def calculate_expanding_var(
     Returns:
     -------
     pd.DataFrame
-        A DataFrame with the original values and their corresponding VaR values, starting from the specified `start_date`.
+        A DataFrame with the original values and their corresponding VaR values, starting from the specified `end_training_date` + 1.
         Columns include:
             - Original data values.
             - Calculated VaR values using the specified quantile level.
@@ -1216,7 +1241,7 @@ def calculate_expanding_var(
     Usage:
     -----
     ```python
-    VaR_df = calculate_expanding_var(data=my_data, start_date='2000-12-29', plot=True)
+    VaR_df = calculate_expanding_var(data=my_data, end_training_date='2000-12-29', plot=True)
     display(VaR_df)
     
     # Example usage
@@ -1256,7 +1281,7 @@ def calculate_expanding_var(
     else:
         raise ValueError("When providing a DataFrame, `column_name` must be specified.")
     
-    first_date = pd.to_datetime(start_date)
+    first_date = pd.to_datetime(end_training_date)
     
     # Use alternative method if specified
     if alternative_method:
@@ -1474,7 +1499,7 @@ def var_calculator(
 
 def calculate_rolling_var(
     data: Union[pd.DataFrame, pd.Series], 
-    start_date: str, 
+    end_training_date: str, 
     column_name: str = None, 
     quantile: float = 0.05, 
     window_size: int = 60,
@@ -1492,8 +1517,8 @@ def calculate_rolling_var(
     data : Union[pd.DataFrame, pd.Series]
         The input DataFrame or Series containing financial time series data.
         
-    start_date : str
-        The start date from which to begin calculating the VaR.
+    end_training_date : str
+        The end_training_date from which to begin calculating the VaR (one before actual VAR datapoint).
         
     column_name : str, optional
         The name of the column in `data` for which VaR is to be calculated. If `data` is a Series, this is not needed.
@@ -1511,7 +1536,7 @@ def calculate_rolling_var(
     Returns:
     -------
     pd.DataFrame
-        A DataFrame with the original values and their corresponding VaR values, starting from the specified `start_date`.
+        A DataFrame with the original values and their corresponding VaR values, starting from the specified `end_training_date` + 1.
         Columns include:
             - Original data values.
             - Calculated VaR values using the specified quantile level.
@@ -1519,7 +1544,7 @@ def calculate_rolling_var(
     Usage:
     -----
     ```python
-    VaR_df = calculate_rolling_var(data=my_data, start_date='2000-12-29', plot=True)
+    VaR_df = calculate_rolling_var(data=my_data, end_training_date='2000-12-29', plot=True)
     display(VaR_df)
     
     # Example usage
@@ -1527,16 +1552,22 @@ def calculate_rolling_var(
     display(VaR_df)
 
     # Frequency Calculation
-    frequency = (VaR_df["Excess Market Returns_VaR_0.05"] > VaR_df["Excess Market Returns"]).value_counts()
-    display(frequency)
-    print(f"Frequency of Excess Market Returns below VaR: {frequency[True]}")
+    quantile = 0.05
+    hits = (VaR_df["Excess Market Returns"] < VaR_df["Excess Market Returns_Rolling_VaR_0.05"]).value_counts()[True]
+    hit_ratio = hits / len(VaR_df)
+    hit_rate = np.abs((hit_ratio/quantile)-1)
+    print(f"Number of hits: {hits}")
+    print(f"Hit rate: {hit_rate:.5f}")
+    print(f"Hit ratio: {hit_ratio:.5f}")
+    
     ```
     
     Explanation:
     ------------
     The function calculates the following:
     - **Rolling Window VaR**: Calculates VaR by applying a rolling window to the data, ensuring that each VaR value is based on 
-      a consistent historical sample size. This provides a dynamic view of risk over time.
+      a consistent historical sample size. This provides a dynamic view of risk over time. Note need to apply filter after rolling
+      calculations as window size might not be equal to first date intended for VaR calculation.
     - **Plotting**: Allows users to visually assess periods where the returns fall below the VaR threshold, offering insights 
       into the frequency and severity of extreme returns.
     """
@@ -1550,15 +1581,16 @@ def calculate_rolling_var(
     else:
         raise ValueError("When providing a DataFrame, `column_name` must be specified.")
     
-    first_date = pd.to_datetime(start_date)
+    first_date = pd.to_datetime(end_training_date)
     
     # Calculate rolling VaR
-    var_series = target_data.rolling(window=window_size).quantile(quantile)
+    
+    var_series = target_data.rolling(window=window_size, center=False).quantile(quantile).shift(1)
     combined_data = pd.concat([target_data, var_series], axis=1).dropna()
     combined_data.columns = [target_data.name, f"{target_data.name}_Rolling_VaR_{quantile}"]
     
     # Limit data to the start date
-    combined_data = combined_data.loc[first_date:]
+    combined_data = combined_data.loc[first_date:].iloc[1:]
 
     # Plot if requested
     if plot:
@@ -1601,6 +1633,419 @@ def calculate_rolling_var(
     return combined_data
 
 
+def calculate_ewma_volatility(data: pd.DataFrame, start_date: str, column_name:str, theta: float = 0.94, initial_sigma: float = 0.20 / np.sqrt(252)) -> pd.Series:
+    """
+    Calculate EWMA volatility.
+    
+    Args:
+    data (pd.Series): Time series of returns.
+    theta (float): Decay factor for the EWMA.
+    initial_sigma (float): Initial volatility estimate.
+    
+    Returns:
+    pd.Series: EWMA volatility of the returns.
+    
+    ```python
+    ewma_vol_df = calculate_ewma_volatility(data, '2001-01-02', 'Excess Market Returns')
+    display(ewma_vol_df)
+    display(pd.concat([expanding_vol_df, rolling_vol_df, ewma_vol_df], axis=1))
+    ```
+    
+    """
+    calculation_data = data[column_name]
+    sigma_squared = np.zeros_like(calculation_data)
+    sigma_squared[0] = initial_sigma**2
+    
+    for t in range(1, len(calculation_data)):
+        sigma_squared[t] = theta * sigma_squared[t-1] + (1 - theta) * calculation_data.iloc[t-1]**2
+    new_data = pd.Series(np.sqrt(sigma_squared), index=data.index).loc[start_date:,]
+    new_data.name = f"{column_name}_EWMA_volatility"
 
+    
+    return new_data
 
+def calculate_rolling_vol(data: pd.DataFrame, start_date: str, column_name: str, window_size: int =252) -> pd.DataFrame:
+    """
+    Calculates the expanding window volatility for a given column in a DataFrame starting from a specific date,
+    where volatility is defined as the square root of the sum of squared returns up to each point.
+    
+    Args:
+    data (pd.DataFrame): The input DataFrame containing financial time series data.
+    start_date (str): The start date from which to begin calculating the volatility.
+    column_name (str): The name of the column in `data` for which volatility is to be calculated.
+    
+    ```python
+    rolling_vol_df = calculate_rolling_vol(data, '2001-01-02', 'Excess Market Returns')
+    display(rolling_vol_df)
+    ```
+    
+    """
+    first_date = pd.to_datetime(start_date)
+    vol_series = data.loc[:,column_name].rolling(window=window_size,center=False).apply(lambda x: np.sqrt(np.sum(x**2)/ window_size)).shift(1)
+    
+    # combined_data = pd.concat([data.loc[first_date:, column_name], vol_series], axis=1).dropna()
+    vol_series.name = f"{column_name}_rolling_window_volatility"
+    return vol_series.loc[first_date:].dropna()
+
+def calculate_expanding_vol(data: pd.DataFrame, start_date: str, column_name: str) -> pd.DataFrame:
+    """
+    Calculates the expanding window volatility for a given column in a DataFrame starting from a specific date,
+    where volatility is defined as the square root of the sum of squared returns up to each point.
+    
+    Args:
+    data (pd.DataFrame): The input DataFrame containing financial time series data.
+    start_date (str): The start date from which to begin calculating the volatility.
+    column_name (str): The name of the column in `data` for which volatility is to be calculated.
+    
+    ```python
+    expanding_vol_df = calculate_expanding_vol(data, '2001-01-02', 'Excess Market Returns')
+    display(expanding_vol_df)
+    ```
+    
+    
+    """
+    first_date = pd.to_datetime(start_date)
+    # calculation_data = data.loc[:first_date, column_name]
+    
+    vol_series = data.loc[:,column_name].expanding(min_periods=2).apply(lambda x: np.sqrt(np.sum(x**2)/ (len(x)-1))).shift(1)
+    vol_series.name = f"{column_name}_expanding_window_volatility"
+    
+
+    
+    return vol_series.loc[first_date:].dropna()
+
+def calculate_volatility(
+    return_series: pd.Series, 
+    method: str = "expanding", 
+    window: int = 252, 
+    theta: float = 0.94, 
+    initial_vol: float = 0.2 / np.sqrt(252)
+) -> pd.Series:
+    """
+    Calculate the volatility of a return series using different methods: expanding, rolling, or EWMA (Exponentially Weighted Moving Average).
+    
+    Parameters:
+    ----------
+    return_series : pd.Series
+        A time series of returns for which volatility needs to be calculated.
+        
+    method : str, optional (default="expanding")
+        The method to use for volatility calculation. Options include:
+        - "expanding": Uses an expanding window to calculate volatility.
+        - "rolling": Uses a rolling window to calculate volatility.
+        - "ewma": Uses an exponentially weighted moving average to calculate volatility.
+        
+    window : int, optional (default=252)
+        The size of the window for the rolling volatility calculation. Ignored if `method="ewma"` or `method="expanding"`.
+        
+    theta : float, optional (default=0.94)
+        The decay factor used for EWMA volatility calculation. Only used if `method="ewma"`.
+        
+    initial_vol : float, optional (default=0.2 / sqrt(252))
+        The initial volatility value used to seed the EWMA calculation. Only used if `method="ewma"`.
+        
+    Returns:
+    -------
+    pd.Series
+        A time series of calculated volatility based on the selected method.
+    
+    Usage:
+    -----
+    ```python
+    # Calculate expanding volatility
+    expanding_volatility = calculate_volatility(data["Excess Market Returns"], method="expanding")
+    display(expanding_volatility.shift(1).loc[pd.to_datetime("2001-01-02"):])
+    
+    # Calculate rolling volatility
+    rolling_volatility = calculate_volatility(data["Excess Market Returns"], method="rolling", window=252)
+    display(rolling_volatility.shift(1).loc[pd.to_datetime("2001-01-02"):])
+    
+    # Calculate EWMA volatility
+    ewma_volatility = calculate_volatility(data["Excess Market Returns"], method="ewma", theta=0.94, initial_vol=0.2 / np.sqrt(252))
+    display(ewma_volatility.shift(1).loc[pd.to_datetime("2001-01-02"):])
+    ```
+    
+    Explanation:
+    ------------
+    The function allows for three methods of volatility calculation:
+    - **Expanding Volatility**: Calculates the volatility over an expanding window, providing a cumulative measure that includes all data up to each point.
+    - **Rolling Volatility**: Uses a fixed-size rolling window to calculate volatility, providing a moving measure that adapts as the window slides over time.
+    - **EWMA Volatility**: Applies an exponentially weighted moving average to capture recent changes more sensitively, with a decay factor determining how much weight is given to recent vs. older data.
+    """
+    
+    def expanding_vol(series: pd.Series) -> pd.Series:
+        return np.sqrt((series ** 2).expanding().mean())
+
+    def rolling_vol(series: pd.Series, window: int) -> pd.Series:
+        return np.sqrt((series ** 2).rolling(window).mean())
+
+    def calc_ewma_volatility(series: pd.Series, theta: float, initial_vol: float) -> pd.Series:
+        var_t0 = initial_vol ** 2
+        ewma_var = [var_t0]
+        for i in range(len(series.index)):
+            new_ewma_var = ewma_var[-1] * theta + (series.iloc[i] ** 2) * (1 - theta)
+            ewma_var.append(new_ewma_var)
+        ewma_var.pop(0)  # Remove var_t0
+        ewma_vol = [np.sqrt(v) for v in ewma_var]
+        return pd.Series(ewma_vol, index=series.index)
+
+    # Select the method for volatility calculation
+    if method == "expanding":
+        return expanding_vol(return_series)
+    elif method == "rolling":
+        return rolling_vol(return_series, window)
+    elif method == "ewma":
+        return calc_ewma_volatility(return_series, theta, initial_vol)
+    else:
+        raise ValueError("Invalid method selected. Choose from 'expanding', 'rolling', or 'ewma'.")
+
+def parametric_VaR_one_ahead(
+    data: pd.DataFrame, 
+    start_date: str, 
+    column_name: str, 
+    confidence_level: Union[float, None] = 0.95, 
+    z_score: Union[float, None] = None, 
+    window_size: int = 252, 
+    theta: float = 0.94, 
+    initial_vol: float = 0.2 / np.sqrt(252)
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Calculate one-day-ahead VaR using parametric methods (expanding, rolling, EWMA) and return hit rate analysis.
+    
+    Parameters:
+    ----------
+    data : pd.DataFrame
+        The input DataFrame containing the time series of returns.
+        
+    start_date : str
+        The start date from which to begin calculating the VaR estimates.
+        
+    column_name : str
+        The name of the column in `data` for which VaR is to be calculated.
+        
+    confidence_level : float, optional (default=0.95)
+        The confidence level for VaR calculation. Commonly set at 0.95 for a 5% risk threshold.
+        
+    z_score : float, optional (default=None)
+        Directly specify a z-score for the VaR calculation instead of deriving it from the confidence level.
+        
+    window_size : int, optional (default=252)
+        The window size for the rolling volatility calculation.
+        
+    theta : float, optional (default=0.94)
+        The decay factor used for EWMA volatility calculation.
+        
+    initial_vol : float, optional (default=0.2 / sqrt(252))
+        The initial volatility value used to seed the EWMA calculation.
+        
+    Returns:
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        - A DataFrame with the original returns, one-day-ahead VaR estimates, and indicators for VaR breaches.
+        - A DataFrame summarizing hit count, hit ratio, and hit rate error for each volatility method.
+        
+    Usage:
+    -----
+    ```python
+    one_day_ahead_combined_data, results, var_data = parametric_VaR_one_ahead(
+        data=data, 
+        start_date='2001-01-02', 
+        column_name="Excess Market Returns",
+        confidence_level=0.95,
+        window_size=252,
+        theta=0.94
+    )
+
+    print("One-Day-Ahead VaR Analysis:")
+    display(one_day_ahead_combined_data.loc[:, ["VaR_Expanding", "VaR_Rolling", "VaR_EWMA"]].apply(pd.Series.value_counts).iloc[1])
+
+    print("Hit Rate Analysis:")
+    display(results)
+    print("Historical VaR Estimates:")
+    display(var_data)
+    ```
+    """
+    # Determine z-score based on confidence level or use the provided z-score
+    if z_score is None and confidence_level is not None:
+        z_score = norm.ppf(1 - confidence_level)
+    elif z_score is None:
+        raise ValueError("Either `confidence_level` or `z_score` must be provided.")
+    
+    # Calculate the expanding, rolling, and EWMA volatilities
+    expanding_vol_df = calculate_expanding_vol(data, start_date=start_date, column_name=column_name)
+    rolling_vol_df = calculate_rolling_vol(data, start_date=start_date, column_name=column_name, window_size=window_size)
+    ewma_vol_df = calculate_ewma_volatility(data, start_date=start_date, column_name=column_name, theta=theta, initial_sigma=initial_vol)
+    
+    # Combine the volatility estimates
+    combined_data = pd.concat([expanding_vol_df, rolling_vol_df, ewma_vol_df], axis=1)
+    
+    # Calculate one-day-ahead VaR by multiplying the volatilities by the negative z-score
+    one_day_ahead_data = combined_data.apply(lambda x: x * z_score, axis=0)
+    
+    # Combine the original data with the one-day-ahead VaR estimates
+    one_day_ahead_combined_data = pd.concat(
+        [data.loc[pd.to_datetime(start_date):, column_name], one_day_ahead_data], 
+        axis=1
+    )
+    
+    # Evaluate whether the actual returns fall below the VaR estimates (indicating a breach)
+    one_day_ahead_combined_data.eval(
+        f"""
+        VaR_Expanding = `{column_name}` < `{column_name}_expanding_window_volatility`
+        VaR_Rolling = `{column_name}` < `{column_name}_rolling_window_volatility`
+        VaR_EWMA = `{column_name}` < `{column_name}_EWMA_volatility`
+        """, 
+        inplace=True
+    )
+    
+    # Calculate hit counts (the number of times actual returns are less than VaR estimates)
+    hit_counts = one_day_ahead_combined_data.loc[:, ["VaR_Expanding", "VaR_Rolling", "VaR_EWMA"]].apply(pd.Series.value_counts).iloc[1]
+    
+    # Calculate hit ratios (percentage of times actual returns are less than VaR estimates)
+    total_days = len(one_day_ahead_combined_data)
+    hit_ratios = hit_counts / total_days
+    
+    # Calculate hit rate error (difference from the expected rate, 5% or 0.05)
+    expected_rate = 1 - confidence_level if confidence_level else norm.cdf(z_score)
+    hit_rate_error = abs((hit_ratios / expected_rate) - 1)
+    
+    # Combine and return the results
+    results = pd.DataFrame({
+        "Hit Count": hit_counts,
+        "Hit Ratio": hit_ratios,
+        "Hit Rate Error": hit_rate_error
+    }, index=["VaR_Expanding", "VaR_Rolling", "VaR_EWMA"])
+    one_day_ahead_data.columns = ["Expanding_window_VaR", "Rolling_window_VaR", "EWMA_VaR"]
+    return one_day_ahead_combined_data, results, one_day_ahead_data
+
+def parametric_CVaR_one_ahead(
+    data: pd.DataFrame, 
+    start_date: str, 
+    column_name: str, 
+    confidence_level: Union[float, None] = 0.95, 
+    z_score: Union[float, None] = None, 
+    window_size: int = 252, 
+    theta: float = 0.94, 
+    initial_vol: float = 0.2 / np.sqrt(252)
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Calculate one-day-ahead Conditional Value at Risk (CVaR) using parametric methods (expanding, rolling, EWMA) 
+    and return hit rate analysis along with CVaR estimates.
+    
+    Parameters:
+    ----------
+    data : pd.DataFrame
+        The input DataFrame containing the time series of returns.
+        
+    start_date : str
+        The start date from which to begin calculating the CVaR estimates.
+        
+    column_name : str
+        The name of the column in `data` for which CVaR is to be calculated.
+        
+    confidence_level : float, optional (default=0.95)
+        The confidence level for CVaR calculation. Commonly set at 0.95, which corresponds to a 5% risk threshold.
+        
+    z_score : float, optional (default=None)
+        Directly specify a z-score for the CVaR calculation instead of deriving it from the confidence level. 
+        If provided, this value will override the calculation from `confidence_level`.
+        
+    window_size : int, optional (default=252)
+        The window size for the rolling volatility calculation.
+        
+    theta : float, optional (default=0.94)
+        The decay factor used for EWMA (Exponentially Weighted Moving Average) volatility calculation.
+        
+    initial_vol : float, optional (default=0.2 / sqrt(252))
+        The initial volatility value used to seed the EWMA calculation.
+        
+    Returns:
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        - A DataFrame with the original returns, one-day-ahead CVaR estimates, and indicators for CVaR breaches.
+        - A DataFrame summarizing hit count, hit ratio, and hit rate error for each volatility method.
+        - A DataFrame showing the one-day-ahead CVaR estimates calculated using each method.
+        
+    Explanation:
+    ------------
+    This function calculates one-day-ahead CVaR estimates for a given financial time series using three volatility estimation methods:
+    
+    1. **Expanding Volatility**: Measures volatility over an expanding window, updating as more data points are included.
+    2. **Rolling Volatility**: Measures volatility over a fixed-size rolling window, providing a moving measure that adjusts as the window slides over time.
+    3. **EWMA (Exponentially Weighted Moving Average) Volatility**: Uses a decay factor to give more weight to recent data, capturing recent volatility patterns.
+
+    The function converts the confidence level into a z-score, which is used to scale the volatility estimates into CVaR estimates. 
+    It also checks whether the actual returns fall below the CVaR estimates, indicating breaches, and calculates hit rates for each method. 
+    Finally, it provides a summary of the hit counts, hit ratios, and hit rate errors for each method.
+
+    Usage:
+    -----
+    ```python
+one_day_ahead_combined_data, hit_rate_results, cvar_historical = parametric_CVaR_one_ahead(data,start_date='2001-01-02',column_name="Excess Market Returns",z_score=-1.65,window_size=252,theta=0.94,initial_vol=0.2 / np.sqrt(252))
+print("One-Day-Ahead CVaR Analysis:")
+display(one_day_ahead_combined_data.loc[:, ["CVaR_Expanding", "CVaR_Rolling", "CVaR_EWMA"]].apply(pd.Series.value_counts).iloc[1])
+
+print("Hit Rate Analysis:")
+display(hit_rate_results)
+
+print("Historical CVaR Estimates:")
+display(cvar_historical)
+    ```
+    """
+    # Determine z-score based on confidence level or use the provided z-score
+    if z_score is None and confidence_level is not None:
+        z_score = norm.ppf(1 - confidence_level)
+    elif z_score is None:
+        raise ValueError("Either `confidence_level` or `z_score` must be provided.")
+    
+    # Convert z-score for CVaR (using -norm.pdf(z_score) / quantile_level)
+    quantile_level = 1 - confidence_level
+    cvar_factor = -norm.pdf(z_score) / quantile_level
+    
+    # Calculate the expanding, rolling, and EWMA volatilities
+    expanding_vol_df = calculate_expanding_vol(data, start_date=start_date, column_name=column_name)
+    rolling_vol_df = calculate_rolling_vol(data, start_date=start_date, column_name=column_name, window_size=window_size)
+    ewma_vol_df = calculate_ewma_volatility(data, start_date=start_date, column_name=column_name, theta=theta, initial_sigma=initial_vol)
+    
+    # Combine the volatility estimates
+    combined_data = pd.concat([expanding_vol_df, rolling_vol_df, ewma_vol_df], axis=1)
+    
+    # Calculate one-day-ahead CVaR by multiplying the volatilities by the CVaR factor
+    one_day_ahead_data = combined_data.apply(lambda x: x * cvar_factor, axis=0)
+    
+    # Combine the original data with the one-day-ahead CVaR estimates
+    one_day_ahead_combined_data = pd.concat(
+        [data.loc[pd.to_datetime(start_date):, column_name], one_day_ahead_data], 
+        axis=1
+    )
+    
+    # Evaluate whether the actual returns fall below the CVaR estimates (indicating a breach)
+    one_day_ahead_combined_data.eval(
+        f"""
+        CVaR_Expanding = `{column_name}` < `{column_name}_expanding_window_volatility`
+        CVaR_Rolling = `{column_name}` < `{column_name}_rolling_window_volatility`
+        CVaR_EWMA = `{column_name}` < `{column_name}_EWMA_volatility`
+        """, 
+        inplace=True
+    )
+    
+    # Calculate hit counts (the number of times actual returns are less than CVaR estimates)
+    hit_counts = one_day_ahead_combined_data.loc[:, ["CVaR_Expanding", "CVaR_Rolling", "CVaR_EWMA"]].apply(pd.Series.value_counts).iloc[1]
+    
+    # Calculate hit ratios (percentage of times actual returns are less than CVaR estimates)
+    total_days = len(one_day_ahead_combined_data)
+    hit_ratios = hit_counts / total_days
+    
+    # Calculate hit rate error (difference from the expected rate, 5% or 0.05)
+    expected_rate = quantile_level
+    hit_rate_error = abs((hit_ratios / expected_rate) - 1)
+    
+    # Combine the hit rate results
+    hit_rate_results = pd.DataFrame({
+        "Hit Count": hit_counts,
+        "Hit Ratio": hit_ratios,
+        "Hit Rate Error": hit_rate_error
+    }, index=["CVaR_Expanding", "CVaR_Rolling", "CVaR_EWMA"])
+    one_day_ahead_data.columns = ["Expanding_window_CVaR", "Rolling_window_CVaR", "EWMA_CVaR"]
+    return one_day_ahead_combined_data, hit_rate_results, one_day_ahead_data
 
