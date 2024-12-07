@@ -12,7 +12,7 @@ import seaborn as sns
 
 import statsmodels.api as sm
 from sklearn.linear_model import LinearRegression
-
+from statsmodels.regression.rolling import RollingOLS
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -2327,3 +2327,100 @@ def calc_dynamic_carry_trade(
         keep_indexes=keep_indexes, drop_indexes=drop_indexes,
         drop_before_keep=drop_before_keep
     )
+
+
+def oos_forecast(signals, asset, t = 60, rolling = False, roll_exp = False, intercept = True):
+    
+    '''
+    Computes an out-of-sample forecast based on expanding regression periods
+    
+    signals: DataFrame containing the signals (regressors) to be used in each regression
+    asset: DataFrame containing the values (returns) of the asset being predicted
+    t: The minimum number of periods
+    rolling: False if expanding, else enter an integer window
+    roll_exp: If using rolling, indicate whether to use expanding up to the minimum periods 
+    intercept: Boolean indicating the inclusion of an intercept in the regressions
+    '''
+    
+    n = len(signals)
+    
+    if intercept:
+        signals = sm.add_constant(signals)
+    
+    if t > n:
+        
+        raise ValueError('Min. periods (t) greater than number of data points')
+    
+    output = pd.DataFrame(index = signals.index, columns = ['Actual','Predicted','Null'])
+    
+    # If expanding
+    if not rolling:
+        
+        for i in range(t,n):
+
+            y = asset.iloc[:i]
+            x = signals.iloc[:i].shift()
+
+            if intercept:
+                null_pred = y.mean()
+
+            else:
+                null_pred = 0
+
+            model = sm.OLS(y,x,missing='drop').fit()
+
+            pred_x = signals.iloc[[i - 1]]
+            pred = model.predict(pred_x)[0]
+
+            output.iloc[i]['Actual'] = asset.iloc[i]
+            output.iloc[i]['Predicted'] = pred
+            output.iloc[i]['Null'] = null_pred
+    
+    # If rolling
+    else:
+        
+        if rolling > n:
+            
+            raise ValueError('Rolling window greater than number of data points')
+        
+        y = asset
+        x = signals.shift()
+        
+        if intercept:
+            
+            if roll_exp:
+                null_pred = y.rolling(window = rolling, min_periods = 0).mean().shift()
+            else:
+                null_pred = y.rolling(window = rolling).mean().shift()
+
+        else:
+            null_pred = 0
+        
+        # When expanding == True, there is a minimum number of observations
+        # Keep ^ in mind
+        model = RollingOLS(y,x,window = rolling, expanding = roll_exp).fit()
+
+        output['Actual'] = asset
+        output['Predicted'] = (model.params * signals).dropna().sum(axis=1).shift()
+        output['Null'] = null_pred
+        
+        
+    return output
+
+
+def oos_r_squared(data):
+    
+    '''
+    Computes the out-of-sample r squared
+    data: DataFrame containing actual, model-predicted, and null-predicted values
+    '''
+    
+    model_error = data['Actual'] - data['Predicted']
+    null_error = data['Actual'] - data['Null']
+    
+    r2_oos = 1 - (model_error ** 2).sum() / (null_error ** 2).sum()
+    
+    return r2_oos
+
+
+# Create a trading returns func that takes in a trading implementation func
